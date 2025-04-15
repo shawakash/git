@@ -1,0 +1,9 @@
+[package]
+name = "git"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.98"
+clap = { version = "4.5.36", features = ["derive"] }
+flate2 = "1.1.1"
