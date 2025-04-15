@@ -1,10 +1,12 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use flate2::read::ZlibDecoder;
+use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
+use sha1::{Digest, Sha1};
 use std::{
     ffi::CStr,
     fs,
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader, Read, Write},
+    path::{Path, PathBuf},
 };
 
 #[derive(Parser, Debug)]
@@ -20,9 +22,16 @@ enum Commands {
 
     CatFile {
         #[clap(short = 'p')]
-        preety_print: bool,
+        pretty_print: bool,
 
         object_hash: String,
+    },
+
+    HashObject {
+        #[clap(short = 'w')]
+        write: bool,
+
+        file: PathBuf,
     },
 }
 
@@ -38,16 +47,16 @@ fn main() -> anyhow::Result<()> {
         match command {
             Commands::Init => {
                 fs::create_dir(".git").unwrap();
-                fs::create_dir(".git/object").unwrap();
+                fs::create_dir(".git/objects").unwrap();
                 fs::create_dir(".git/refs").unwrap();
                 fs::write(".git/HEAD", "ref: refs/heads/main\n").unwrap();
                 println!("Initialized empty Git repository in .git/");
             }
             Commands::CatFile {
-                preety_print,
+                pretty_print,
                 object_hash,
             } => {
-                anyhow::ensure!(preety_print, "mode should contain -p");
+                anyhow::ensure!(pretty_print, "mode should contain -p");
                 let path = format!(".git/objects/{}/{}", &object_hash[..2], &object_hash[2..]);
                 let file = fs::File::open(&path).context("open in .git/objects")?;
 
@@ -90,10 +99,71 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+            Commands::HashObject { write, file } => {
+                fn write_blob<W>(file: &Path, writer: W) -> anyhow::Result<String>
+                where
+                    W: Write,
+                {
+                    let stat = fs::metadata(&file)
+                        .with_context(|| format!("file stat: {}", file.display()))?;
+
+                    let writer = ZlibEncoder::new(writer, Compression::default());
+                    let mut writer = HashWriter {
+                        writer,
+                        hasher: Sha1::new(),
+                    };
+
+                    write!(writer, "blob ")?;
+                    write!(writer, "{}\0", stat.len())?;
+                    let mut file = fs::File::open(&file)
+                        .with_context(|| format!("open file: {}", &file.display()))?;
+                    std::io::copy(&mut file, &mut writer).with_context(|| format!("copy file"))?;
+                    let _ = writer.writer.finish()?;
+                    let hash = writer.hasher.finalize();
+                    Ok(hex::encode(hash))
+                }
+                let hash = if write {
+                    let tmp = "temporary";
+                    let hash = write_blob(
+                        &file,
+                        fs::File::create(tmp).context("temporary file for blob")?,
+                    )
+                    .context("write out blob ")?;
+                    fs::create_dir_all(format!(".git/objects/{}", &hash[..2]))
+                        .context("create subdir .git/objects/xx")?;
+                    fs::rename(tmp, format!(".git/objects/{}/{}", &hash[..2], &hash[2..]))
+                        .context("rename temporary file to .git/objects/xx/yy")?;
+                    hash
+                } else {
+                    write_blob(&file, std::io::sink()).context("")?
+                };
+
+                println!("{hash}");
+            }
         }
     } else {
         println!("No command provided. Use --help for more information.");
     }
 
     Ok(())
+}
+
+struct HashWriter<W> {
+    writer: W,
+    hasher: Sha1,
+}
+
+impl<W> Write for HashWriter<W>
+where
+    W: Write,
+{
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.writer.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush()
+    }
 }
